@@ -1,0 +1,236 @@
+# 请先更改下PATH，PATH为本地部署模型以及配置存储位置
+$ErrorActionPreference='Stop'
+
+# ===== 0) 路径 =====
+$Root="PATH"
+$Conf=Join-Path $Root "conf"
+$Vols=Join-Path $Root "volumes"
+$WS  =Join-Path $Vols "workspace"
+$VolMongo = Join-Path $Vols "mongo"
+$VolOllama= Join-Path $Vols "ollama"
+$Lcy=Join-Path $Conf "librechat.yaml"
+$ComposePath=Join-Path $Root "docker-compose.yml"
+$AuthJson=Join-Path $Conf "auth.json"
+$McpCfg=Join-Path $Conf "mcp-gateway.yaml"
+$Cache=Join-Path $Vols "image_cache"
+$enc=New-Object System.Text.UTF8Encoding($false)
+New-Item -Force -ItemType Directory $Conf,$Vols,$WS,$VolMongo,$VolOllama,$Cache | Out-Null
+if(-not (Test-Path $AuthJson)){ '{}' | Out-File -Encoding utf8NoBOM $AuthJson }
+
+# ===== 1) 清理仅本栈容器与网络 =====
+"librechat","ollama","mongo","mcp-gateway" | %{
+  $id=(docker ps -aq -f "name=^$_$") 2>$null; if($id){ docker rm -f $id | Out-Null }
+}
+try{ docker network rm libre-local_default | Out-Null }catch{}
+
+# ===== 2) LibreChat 配置：仅 docker-mcp-gateway（fetch=false 保持）=====
+# 已确认：serverInstructions:false，避免“Server Instructions: undefined”
+$yaml=@'
+version: "1.3.1"
+endpoints:
+  custom:
+    - name: "LocalOllama"
+      apiKey: "ollama"
+      baseURL: "http://ollama:11434/v1/"
+      fetch: false
+      titleConvo: false
+      summarize: false
+      assistants: false
+      models:
+        default: ["qwen3:8b","gemma3:4b"]
+      modelDisplayLabel: "Ollama"
+
+mcpServers:
+  docker-mcp-gateway:
+    type: "sse"
+    url: "http://mcp-gateway:8080/sse"
+    headers:
+      sessionid: "{{LIBRECHAT_USER_ID}}"
+    serverInstructions: false
+    timeout: 120000
+    initTimeout: 300000
+'@
+$yaml=($yaml -replace '\p{Cf}',''); [IO.File]::WriteAllText($Lcy,$yaml,$enc)
+
+# ===== 2.1) 网关 YAML（空映射） =====
+$mcpYaml=@'
+servers: {}
+'@
+[IO.File]::WriteAllText($McpCfg,$mcpYaml,$enc)
+
+# ===== 3) docker-compose（仅两处修复点，其余不变）=====
+$ConfY  = $Conf      -replace "'","''"
+$WSY    = $WS        -replace "'","''"
+$VolMY  = $VolMongo  -replace "'","''"
+$VolOY  = $VolOllama -replace "'","''"
+$AuthY  = $AuthJson  -replace "'","''"
+$McpCfgY= $McpCfg    -replace "'","''"
+$CacheY = $Cache     -replace "'","''"
+
+$compose=@"
+name: libre-local
+services:
+  mongo:
+    container_name: mongo
+    image: mongo:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD","mongosh","--eval","db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - type: bind
+        source: '$VolMY'
+        target: /data/db
+
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    volumes:
+      - type: bind
+        source: '$VolOY'
+        target: /root/.ollama
+      - type: bind
+        source: '$CacheY'
+        target: /cache
+
+  mcp-gateway:
+    container_name: mcp-gateway
+    image: docker/mcp-gateway:latest
+    command: ["--transport=sse","--port=8080","--servers=dockerhub,duckduckgo,firecrawl,github-official,sequentialthinking,grafana","--config=/conf/mcp-gateway.yaml","--watch"]
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    volumes:
+      - type: bind
+        source: '$ConfY'
+        target: /conf
+      - type: bind
+        source: '$WSY'
+        target: /workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  librechat:
+    container_name: librechat
+    image: ghcr.io/danny-avila/librechat:v0.8.0-rc4
+    restart: unless-stopped
+    depends_on:
+      mongo: { condition: service_healthy }
+      mcp-gateway: { condition: service_started }
+      ollama: { condition: service_started }
+    ports: ["3080:3080"]
+    environment:
+      CONFIG_PATH: "/app/conf/librechat.yaml"
+      JWT_SECRET: "test1"
+      JWT_REFRESH_SECRET: "test2"
+      SESSION_SECRET: "test3"
+      CREDS_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      CREDS_IV:  "0123456789abcdef0123456789abcdef"
+      ALLOW_EMAIL_LOGIN: "true"
+      ALLOW_REGISTRATION: "true"
+      ALLOW_SOCIAL_LOGIN: "false"
+      MONGO_URI: "mongodb://mongo:27017/librechat"
+      NO_PROXY: "ollama,localhost,127.0.0.1,::1,host.docker.internal,mcp-gateway"
+      no_proxy: "ollama,localhost,127.0.0.1,::1,host.docker.internal,mcp-gateway"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      DISABLE_AGENTS: "false"          # 修复点 1：启用 Agents，避免空消息校验报错
+      AGENTS_DEFAULT_MODEL: "LocalOllama/qwen3:8b"  # 修复点 2：为 Agents 指定默认模型
+    volumes:
+      - type: bind
+        source: '$ConfY'
+        target: /app/conf
+        read_only: true
+      - type: bind
+        source: '$WSY'
+        target: /workspace
+      - type: bind
+        source: '$AuthY'
+        target: /app/api/data/auth.json
+        read_only: true
+"@
+[IO.File]::WriteAllText($ComposePath,$compose,$enc)
+docker compose -f $ComposePath config | Out-Null
+
+# ===== 3.x) 镜像获取（仅离线；禁止在线 pull）=====
+function Test-LocalImage{ param([string]$Ref) try{ docker image inspect $Ref | Out-Null; return $true }catch{ return $false } }
+$tarMap=@(
+  @{ Path=Join-Path $Cache "mongo_7.tar";            Ref="mongo:7" },
+  @{ Path=Join-Path $Cache "ollama_latest.tar";      Ref="ollama/ollama:latest" },
+  @{ Path=Join-Path $Cache "mcp-gateway_latest.tar"; Ref="docker/mcp-gateway:latest" },
+  @{ Path=Join-Path $Cache "librechat_v0.8.0-rc4.tar"; Ref="ghcr.io/danny-avila/librechat:v0.8.0-rc4" }
+)
+$missing=@()
+foreach($t in $tarMap){
+  if(-not (Test-LocalImage $t.Ref)){
+    if(Test-Path $t.Path){ try{ docker load -i $t.Path | Out-Null }catch{} }
+    if(-not (Test-LocalImage $t.Ref)){ $missing += $t }
+  }
+}
+if($missing.Count -gt 0){
+  $names = ($missing | % { Split-Path -Leaf $_.Path }) -join ", "
+  throw "缺少离线镜像：$names；请先放入 $Cache 后重试（已禁用所有在线拉取）"
+}
+
+# ===== 4) 启动（不触发网络）=====
+docker compose -f $ComposePath up -d
+
+# ===== 5) 等健康 =====
+$deadline=(Get-Date).AddMinutes(3)
+do{ Start-Sleep 3; $st=docker inspect -f "{{.State.Health.Status}}" mongo 2>$null }until($st -eq "healthy" -or (Get-Date) -gt $deadline)
+if($st -ne "healthy"){ throw "Mongo 未就绪" }
+
+# ===== 6) 模型导入（仅离线；未找到不报错）=====
+function Try-Import([string]$fname){
+  $p=Join-Path $Cache $fname
+  if(Test-Path $p){ try{ docker exec ollama ollama import "/cache/$fname" | Out-Null; return $true }catch{ return $false } }
+  return $false
+}
+Get-ChildItem -Path $Cache -Filter "*.ollama" -File -ErrorAction SilentlyContinue | ForEach-Object { Try-Import $_.Name | Out-Null }
+
+# 读取模型列表并预热第一个
+$ModelList = @()
+try{
+  $resp = Invoke-RestMethod -Uri "http://localhost:11434/v1/models" -Method Get -TimeoutSec 3
+  if($resp -and $resp.data){ $ModelList = $resp.data.id }
+}catch{}
+$ModelReady = $ModelList.Count -gt 0
+if($ModelReady){
+  $Primary = $ModelList[0]
+  try{ docker exec ollama sh -lc "printf ok | ollama run $Primary >/dev/null 2>&1 || true" }catch{}
+}
+
+# ===== 7) 网关连通性（SSE）=====
+docker exec mcp-gateway wget -qO- http://127.0.0.1:8080/health | Out-Null
+docker exec librechat   wget -qO- "http://mcp-gateway:8080/health" | Out-Null
+docker exec librechat sh -lc "wget -S -O- --header='Accept: text/event-stream' --timeout=3 'http://mcp-gateway:8080/sse' 2>&1 | head -n 5" | Out-Null
+
+# ===== 8) 重启 LibreChat 并汇总 Tools =====
+docker restart librechat | Out-Null
+Start-Sleep 8
+$since=(Get-Date).AddMinutes(-10).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$log = docker logs librechat --since $since 2>&1
+$toolLines = $log | Select-String -Pattern "\[MCP\].*Tools:"
+$summaryText = ($toolLines | Select-Object -ExpandProperty Line) -join "`r`n"
+$summaryPath = Join-Path $WS "mcp_tools_summary.txt"
+$logPath     = Join-Path $WS "mcp_init_logs.txt"
+[IO.File]::WriteAllText($summaryPath,$summaryText,$enc)
+[IO.File]::WriteAllText($logPath,$log,$enc)
+
+# ===== 9) 自检 =====
+if($ModelReady){
+  $body = @{ model=$Primary; messages=@(@{role="user"; content="只回复ok"}) } | ConvertTo-Json -Depth 5
+  Invoke-RestMethod -Uri "http://localhost:11434/v1/chat/completions" -Method Post -ContentType "application/json" -Body $body | Out-Null
+  docker exec librechat sh -lc "wget -qO- http://ollama:11434/api/tags | head -c 200 >/dev/null"
+}
+
+"`n完成：
+- UI:           http://localhost:3080
+- MCP 网关：     http://localhost:8080/sse
+- 工具清单：      $summaryPath
+- 初始化日志：    $logPath
+- 模型状态：      " + ($(if($ModelReady){"已导入：" + ($ModelList -join ', ')}else{"未发现 .ollama，现阶段仅 UI 与 MCP 可用"}))
