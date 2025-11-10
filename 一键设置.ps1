@@ -1,96 +1,203 @@
-# PowerShell 7.5.4
 # Please fill out the $Root
-$ErrorActionPreference = 'Stop'
+# 一键设置.ps1
+# PowerShell 7.5.4
+param(
+  [string]$Root="",
+  [switch]$ExportImages,
+  [string]$ExportDir=""
+)
 
-# ===== 0) 路径 =====
-$Root=""
-$Conf=Join-Path $Root "conf"
-$Vols=Join-Path $Root "volumes"
-$WS  =Join-Path $Vols "workspace"
+$ErrorActionPreference='Stop'
+$Conf     = Join-Path $Root "conf"
+$Vols     = Join-Path $Root "volumes"
+$WS       = Join-Path $Vols "workspace"
 $VolMongo = Join-Path $Vols "mongo"
 $VolOllama= Join-Path $Vols "ollama"
-$Lcy=Join-Path $Conf "librechat.yaml"
-$ComposePath=Join-Path $Root "docker-compose.yml"
-$AuthJson=Join-Path $Conf "auth.json"
-$McpCfg=Join-Path $Conf "mcp-gateway.yaml"
-$Cache=Join-Path $Vols "image_cache"
-$enc=New-Object System.Text.UTF8Encoding($false)
+$Cache    = Join-Path $Vols "image_cache"
+$Compose  = Join-Path $Root "compose-named.yml"
+$Tmp      = Join-Path $env:TEMP "libre_local_build_$(Get-Random)"
+$NowTag   = (Get-Date -Format "yyyyMMddHHmm")
+$enc      = New-Object System.Text.UTF8Encoding($false)
+
+$ImgLibre = "local/librechat-bundled:1.3.1"
+$ImgMcp   = "local/mcp-gateway-bundled:$NowTag"
+$ImgOll   = "local/ollama-with-models:$NowTag"
+
 New-Item -Force -ItemType Directory $Conf,$Vols,$WS,$VolMongo,$VolOllama,$Cache | Out-Null
-if(-not (Test-Path $AuthJson)){ '{}' | Out-File -Encoding utf8NoBOM $AuthJson }
+if(-not (Test-Path $Tmp)){ New-Item -ItemType Directory -Path $Tmp | Out-Null }
 
-# ===== 1) 清理仅本栈容器与网络 =====
-"librechat","ollama","mongo","mcp-gateway" | %{
-  $id=(docker ps -aq -f "name=^$_$") 2>$null; if($id){ docker rm -f $id | Out-Null }
+# ========== 1) LibreChat 配置 ==========
+$LcyHost = Join-Path $Tmp "librechat.yaml"
+@'
+version: "1.3.0"
+interface:
+  agents: true
+  defaultEndpoint: custom
+endpoints:
+  agents:
+    disableBuilder: false
+    titleConvo: false
+  custom:
+    - name: "LocalOllama"
+      apiKey: "ollama"
+      baseURL: "http://ollama:11434/v1"
+      fetch: true
+      titleConvo: false
+      summarize: false
+      assistants: false
+      models:
+        default: []
+      modelDisplayLabel: "Ollama"
+mcpServers:
+  docker-mcp-gateway:
+    type: "streamable-http"
+    url: "http://mcp-gateway:8080/mcp"
+    headers:
+      sessionid: "{{LIBRECHAT_USER_ID}}"
+    chatMenu: true
+    requiresOAuth: false
+    serverInstructions: true
+    timeout: 120000
+    initTimeout: 300000
+'@ | Out-File -FilePath $LcyHost -Encoding UTF8
+
+$AuthHost = Join-Path $Tmp "auth.json"
+if(-not (Test-Path $AuthHost)){ '{}' | Out-File -FilePath $AuthHost -Encoding utf8NoBOM }
+$McpHost = Join-Path $Tmp "mcp-gateway.yaml"
+'servers: {}' | Out-File -FilePath $McpHost -Encoding UTF8
+
+# ========== 2) 构建镜像 ==========
+$DirLib = Join-Path $Tmp "build_libre"; New-Item -ItemType Directory $DirLib | Out-Null
+Copy-Item $LcyHost  (Join-Path $DirLib "librechat.yaml")  -Force
+Copy-Item $AuthHost (Join-Path $DirLib "auth.json")       -Force
+@'
+FROM ghcr.io/danny-avila/librechat:v0.8.0
+COPY librechat.yaml /app/conf/librechat.yaml
+COPY auth.json      /app/api/data/auth.json
+'@ | Out-File (Join-Path $DirLib "Dockerfile") -Encoding UTF8
+docker build -t $ImgLibre $DirLib | Out-Null
+
+$DirMcp = Join-Path $Tmp "build_mcp"; New-Item -ItemType Directory $DirMcp | Out-Null
+Copy-Item $McpHost (Join-Path $DirMcp "mcp-gateway.yaml") -Force
+@'
+FROM docker/mcp-gateway:latest
+RUN mkdir -p /conf
+COPY mcp-gateway.yaml /conf/mcp-gateway.yaml
+'@ | Out-File (Join-Path $DirMcp "Dockerfile") -Encoding UTF8
+docker build -t $ImgMcp $DirMcp | Out-Null
+
+$DirOll   = Join-Path $Tmp "build_ollama"; New-Item -ItemType Directory $DirOll | Out-Null
+$SeedDir  = Join-Path $DirOll "models";     New-Item -ItemType Directory $SeedDir | Out-Null
+$ScriptFp = Join-Path $DirOll "import-and-serve.sh"
+if(Test-Path $Cache){
+  Get-ChildItem -Path $Cache -Filter "*.ollama" -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Copy-Item $_.FullName (Join-Path $SeedDir $_.Name) -Force }
 }
-try{ docker network rm libre-local_default | Out-Null }catch{}
+$script = @'
+#!/bin/sh
+set -e
+ollama serve &
+PID=$!
+i=0
+while [ "$i" -lt 180 ]; do
+  if ollama list >/dev/null 2>&1; then break; fi
+  i=$((i+1)); sleep 1
+done
+if ls /seed/*.ollama >/dev/null 2>&1; then
+  for f in /seed/*.ollama; do echo "Importing $f"; ollama import "$f" || true; done
+fi
+if ls /cache/*.ollama >/dev/null 2>&1; then
+  for f in /cache/*.ollama; do echo "Importing $f"; ollama import "$f" || true; done
+fi
+wait "$PID"
+'@
+$script = $script -replace "`r`n","`n"
+[IO.File]::WriteAllText($ScriptFp,$script,$enc)
+@'
+FROM ollama/ollama:latest
+RUN mkdir -p /seed /usr/local/bin
+COPY import-and-serve.sh /usr/local/bin/import-and-serve.sh
+RUN chmod +x /usr/local/bin/import-and-serve.sh
+COPY models/ /seed/
+ENTRYPOINT ["/usr/local/bin/import-and-serve.sh"]
+'@ | Out-File (Join-Path $DirOll "Dockerfile") -Encoding UTF8
+docker build -t $ImgOll $DirOll | Out-Null
 
-# ===== 2) 写 docker-compose（移除 --servers 名称式配置，改用 YAML 提供）=====
-$ConfY  = $Conf      -replace "'","''"
-$WSY    = $WS        -replace "'","''"
-$VolMY  = $VolMongo  -replace "'","''"
-$VolOY  = $VolOllama -replace "'","''"
-$AuthY  = $AuthJson  -replace "'","''"
-$McpCfgY= $McpCfg    -replace "'","''"
-$CacheY = $Cache     -replace "'","''"
-
-$compose=@"
+# ========== 3) Compose ==========
+$composeText = @"
 name: libre-local
+volumes:
+  libre_mongo_data:
+  libre_ollama_data:
+  libre_workspace:
+  libre_cache:
+
 services:
   mongo:
-    container_name: mongo
     image: mongo:7
+    container_name: mongo
     restart: unless-stopped
     healthcheck:
-      test: ["CMD","mongosh","--eval","db.adminCommand('ping')"]
+      test:
+        - CMD
+        - mongosh
+        - --eval
+        - "db.adminCommand('ping')"
       interval: 10s
       timeout: 5s
       retries: 12
     volumes:
-      - type: bind
-        source: '$VolMY'
-        target: /data/db
+      - libre_mongo_data:/data/db
 
   ollama:
+    image: $ImgOll
     container_name: ollama
-    image: ollama/ollama:latest
     restart: unless-stopped
-    ports: ["11434:11434"]
+    ports:
+      - "11434:11434"
     volumes:
-      - type: bind
-        source: '$VolOY'
-        target: /root/.ollama
-      - type: bind
-        source: '$CacheY'
-        target: /cache
+      - libre_ollama_data:/root/.ollama
+      - libre_cache:/cache
 
   mcp-gateway:
+    image: $ImgMcp
     container_name: mcp-gateway
-    image: docker/mcp-gateway:latest
     command:
-      - --transport=streaming
-      - --port=8080
-      - --config=/conf/mcp-gateway.yaml
-      - --watch
+      - "--port"
+      - "8080"
+      - "--transport"
+      - "streaming"
+      - "--config=/conf/mcp-gateway.yaml"
+      - "--watch"
     restart: unless-stopped
-    ports: ["8080:8080"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -qO-
+        - http://127.0.0.1:8080/health
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes:
-      - type: bind
-        source: '$ConfY'
-        target: /conf
-      - type: bind
-        source: '$WSY'
-        target: /workspace
+      - libre_workspace:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
 
   librechat:
+    image: $ImgLibre
     container_name: librechat
-    image: ghcr.io/danny-avila/librechat:v0.8.0
     restart: unless-stopped
     depends_on:
-      mongo: { condition: service_healthy }
-      mcp-gateway: { condition: service_started }
-      ollama: { condition: service_started }
-    ports: ["3080:3080"]
+      mongo:
+        condition: service_healthy
+      mcp-gateway:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "3080:3080"
     environment:
       CONFIG_PATH: "/app/conf/librechat.yaml"
       JWT_SECRET: "test1"
@@ -110,110 +217,65 @@ services:
       https_proxy: ""
       DISABLE_AGENTS: "false"
     volumes:
-      - type: bind
-        source: '$ConfY'
-        target: /app/conf
-        read_only: true
-      - type: bind
-        source: '$WSY'
-        target: /workspace
-      - type: bind
-        source: '$AuthY'
-        target: /app/api/data/auth.json
-        read_only: true
+      - libre_workspace:/workspace
 "@
-[IO.File]::WriteAllText($ComposePath,$compose,$enc)
-docker compose -f $ComposePath config | Out-Null
+[IO.File]::WriteAllText($Compose,$composeText,$enc)
 
-# ===== 2.1) 先写空的网关 YAML（稍后覆盖为仅本地可用镜像）=====
-[IO.File]::WriteAllText($McpCfg,"servers: []",$enc)
+# ========== 4) 启动 ==========
+docker compose -f $Compose up -d
 
-# ===== 3) 离线镜像加载检测（含常见 MCP 服务器镜像；仅抑制错误输出）=====
-function Test-LocalImage{
-  param([string]$Ref)
-  & docker image inspect $Ref 1>$null 2>$null
-  if($LASTEXITCODE -eq 0){ return $true } else { return $false }
-}
-$tarMap=@(
-  @{ Path=Join-Path $Cache "mongo_7.tar";               Ref="mongo:7" },
-  @{ Path=Join-Path $Cache "ollama_latest.tar";         Ref="ollama/ollama:latest" },
-  @{ Path=Join-Path $Cache "mcp-gateway_latest.tar";    Ref="docker/mcp-gateway:latest" },
-  @{ Path=Join-Path $Cache "librechat_v0.8.0.tar";      Ref="ghcr.io/danny-avila/librechat:v0.8.0" },
-  # MCP servers（Docker Hub / GHCR）
-  @{ Path=Join-Path $Cache "mcp_duckduckgo_latest.tar"; Ref="mcp/duckduckgo:latest" },
-  @{ Path=Join-Path $Cache "mcp_firecrawl_latest.tar";  Ref="mcp/firecrawl:latest" },
-  @{ Path=Join-Path $Cache "mcp_github_official_latest.tar"; Ref="ghcr.io/github/github-mcp-server:latest" },
-  @{ Path=Join-Path $Cache "mcp_sequentialthinking_latest.tar"; Ref="mcp/sequentialthinking:latest" },
-  @{ Path=Join-Path $Cache "mcp_grafana_latest.tar";    Ref="mcp/grafana:latest" }
-)
-foreach($t in $tarMap){
-  if(-not (Test-LocalImage $t.Ref)){
-    if(Test-Path $t.Path){ try{ docker load -i $t.Path | Out-Null }catch{} }
-  }
-}
-
-# ===== 3.1) 只收集“本机确有”的 MCP 镜像并写回 YAML（避免远程 Catalog）=====
-$candidates=@(
-  "mcp/duckduckgo:latest",
-  "mcp/firecrawl:latest",
-  "ghcr.io/github/github-mcp-server:latest",
-  "mcp/sequentialthinking:latest",
-  "mcp/grafana:latest"
-)
-$present= @()
-foreach($img in $candidates){ if(Test-LocalImage $img){ $present += $img } }
-$serverUris = ($present | ForEach-Object { "  - docker-image://$_" }) -join "`n"
-$cfg = "servers:`n" + ($serverUris -ne "" ? $serverUris : "  []")
-[IO.File]::WriteAllText($McpCfg,$cfg,$enc)
-
-# ===== 4) 先启动依赖服务（不启动 librechat）=====
-docker compose -f $ComposePath up -d mongo ollama mcp-gateway
-
-# ===== 5) 等待 Mongo 健康 =====
+# ========== 5) 健康检查 ==========
 $deadline=(Get-Date).AddMinutes(3)
 do{ Start-Sleep 3; $st=docker inspect -f "{{.State.Health.Status}}" mongo 2>$null }until($st -eq "healthy" -or (Get-Date) -gt $deadline)
 if($st -ne "healthy"){ throw "Mongo 未就绪" }
 
-# ===== 6) 离线导入或在线拉取 Ollama 模型（无 awk/grep）=====
-function Import-OllamaPkgs{
-  Get-ChildItem -Path $Cache -Filter "*.ollama" -File -ErrorAction SilentlyContinue |
-    ForEach-Object { try{ docker exec ollama ollama import "/cache/$($_.Name)" | Out-Null }catch{} }
-}
-Import-OllamaPkgs
-
-function Get-LocalModels{
-  try{
-    $r = Invoke-RestMethod -Uri "http://localhost:11434/v1/models" -Method Get -TimeoutSec 5
-    if($r -and $r.data){ return @($r.data.id) }
-  }catch{}
-  try{
-    $r2 = Invoke-RestMethod -Uri "http://localhost:11434/api/list" -Method Get -TimeoutSec 5
-    if($r2 -and $r2.models){ return @($r2.models.name) }
-  }catch{}
-  return @()
-}
-
-function Ensure-OllamaModel([string]$model){
-  $present = (Get-LocalModels) -contains $model
-  if(-not $present){
-    try{ docker exec ollama ollama pull $model | Out-Null }catch{
-      throw "未发现 $model 的 .ollama 包且在线拉取失败，请将对应 .ollama 放入 $Cache 后重试"
-    }
+function Test-Gw {
+  $paths=@("/health","/","/status","/healthz")
+  foreach($p in $paths){
+    try{
+      $r=Invoke-WebRequest -Uri ("http://127.0.0.1:8080"+$p) -TimeoutSec 5 -Method Get -HttpVersion 1.1 -Headers @{Connection="close"}
+      if($r.StatusCode -ge 200 -and $r.StatusCode -lt 500){ return $true }
+    }catch{}
   }
+  return $false
 }
-Ensure-OllamaModel "qwen3:8b"
-Ensure-OllamaModel "gemma3:4b"
-$ModelList = Get-LocalModels
+$deadline=(Get-Date).AddMinutes(3); $gw=$false
+do{ Start-Sleep 2; $gw=Test-Gw }until($gw -or (Get-Date) -gt $deadline)
+if(-not $gw){
+  docker logs --tail 120 mcp-gateway 2>&1 | Write-Host
+  throw "MCP 网关未就绪"
+}
 
-# ===== 7) 写入 librechat.yaml（streamable-http + /mcp）=====
-if($ModelList.Count -eq 0){ $ModelList=@("qwen3:8b","gemma3:4b") }
-$modelsYaml = ($ModelList | ForEach-Object { '"'+$_+'"' }) -join ", "
+# ========== 6) 模型就绪与预热 ==========
+function Get-OlModels{
+  try{
+    $r=Invoke-RestMethod -Uri "http://127.0.0.1:11434/v1/models" -Method Get -TimeoutSec 8 -HttpVersion 1.1 -Headers @{Accept="application/json";Connection="close"}
+    if($r -and $r.data){ return @($r.data.id) } else { return @() }
+  }catch{ return @() }
+}
+$require="qwen3:8b"
+$models=Get-OlModels
+if($models -notcontains $require){
+  try{ docker exec ollama ollama pull $require }catch{}
+}
+for($i=1;$i -le 240;$i++){ $models=Get-OlModels; if($models -contains $require){break}; Start-Sleep 2 }
 
-$yaml=@"
+# 首轮编译预热
+try{ docker exec -t ollama sh -lc "printf OK | ollama run $require >/dev/null 2>&1 || true" }catch{}
+
+# ========== 7) 更新 LibreChat 默认模型 ==========
+$selected=@()
+if($models -contains $require){ $selected+= $require }
+$preferred=@("gemma3:4b")
+foreach($m in $preferred){ if(($selected -notcontains $m) -and ($models -contains $m)){ $selected+=$m } }
+if($selected.Count -lt 2){ $selected += ($models | Where-Object { $selected -notcontains $_ } | Select-Object -First (2-$selected.Count)) }
+$line = ($selected | ForEach-Object { '"' + $_ + '"' }) -join ","
+$FinalYaml = Join-Path $Tmp "librechat.final.yaml"
+@'
 version: "1.3.0"
 interface:
   agents: true
-
+  defaultEndpoint: custom
 endpoints:
   agents:
     disableBuilder: false
@@ -221,15 +283,14 @@ endpoints:
   custom:
     - name: "LocalOllama"
       apiKey: "ollama"
-      baseURL: "http://ollama:11434/v1/"
+      baseURL: "http://ollama:11434/v1"
+      fetch: true
       titleConvo: false
       summarize: false
       assistants: false
       models:
-        default: [$modelsYaml]
-        fetch: true
+        default: [__PLACEHOLDER_MODELS__]
       modelDisplayLabel: "Ollama"
-
 mcpServers:
   docker-mcp-gateway:
     type: "streamable-http"
@@ -241,11 +302,12 @@ mcpServers:
     serverInstructions: true
     timeout: 120000
     initTimeout: 300000
-"@
-$yaml=($yaml -replace '\p{Cf}',''); [IO.File]::WriteAllText($Lcy,$yaml,$enc)
+'@ -replace '__PLACEHOLDER_MODELS__', $line | Out-File -FilePath $FinalYaml -Encoding UTF8
+docker cp $FinalYaml librechat:/app/conf/librechat.yaml | Out-Null
+docker restart librechat | Out-Null
 
-# ===== 8) 一次性修复历史数据 endpoint=agents → custom =====
-$js=@'
+# ========== 8) 历史数据迁移 ==========
+$PatchJs=@'
 const dbx = db.getSiblingDB("librechat");
 const cols = dbx.getCollectionNames();
 if (cols.includes("convos")) {
@@ -261,58 +323,95 @@ if (cols.includes("presets")) {
   );
 }
 '@
-$patchFile = Join-Path $VolMongo "fix_endpoint.js"
-[IO.File]::WriteAllText($patchFile,$js,$enc)
+$PatchHost = Join-Path $Tmp "fix_endpoint.js"
+[IO.File]::WriteAllText($PatchHost,$PatchJs,$enc)
+docker cp $PatchHost mongo:/data/db/fix_endpoint.js | Out-Null
 docker exec mongo mongosh --file "/data/db/fix_endpoint.js" | Out-Null
 
-# ===== 9) 等网关就绪 再启 LibreChat（先测 TCP 8080 再测 HTTP 并接受 200/400/404/405）=====
-$gwReady=$false
-$deadline=(Get-Date).AddMinutes(2)
-do{
-  Start-Sleep 2
-  try{
-    $tnc = Test-NetConnection -ComputerName 'localhost' -Port 8080 -WarningAction SilentlyContinue
-    if($tnc.TcpTestSucceeded){ $gwReady = $true; break }
-  }catch{}
-  try{
-    $resp = Invoke-WebRequest -Uri "http://localhost:8080/mcp" -Method Get -TimeoutSec 3 -ErrorAction Stop
-    $gwReady = $true
-  }catch{
-    $code = $null
-    if($_.Exception.Response){ $code = [int]$_.Exception.Response.StatusCode }
-    if($code -in 200,400,404,405){ $gwReady = $true } else { $gwReady = $false }
-  }
-} until($gwReady -or (Get-Date) -gt $deadline)
-if(-not $gwReady){ throw "MCP 网关未就绪" }
-
-docker compose -f $ComposePath up -d librechat
-
-# ===== 10) 冷启动一次模型 =====
-if($ModelList.Count -gt 0){
-  $Primary = $ModelList[0]
-  try{ docker exec ollama sh -lc "printf ok | ollama run $Primary >/dev/null 2>&1 || true" }catch{}
+# ========== 9) 可选镜像导出 ==========
+if($ExportImages){
+  if([string]::IsNullOrWhiteSpace($ExportDir)){ $ExportDir = Join-Path $Root "bundle\images" }
+  if(-not (Test-Path $ExportDir)){ New-Item -ItemType Directory -Path $ExportDir -Force | Out-Null }
+  $pairs=@(
+    @{ Img="mongo:7"; Tar="mongo_7.tar" },
+    @{ Img=$ImgOll;   Tar="ollama_with_models.tar" },
+    @{ Img=$ImgMcp;   Tar="mcp_gateway_bundled.tar" },
+    @{ Img=$ImgLibre; Tar="librechat_bundled.tar" }
+  )
+  foreach($p in $pairs){ docker save -o (Join-Path $ExportDir $p.Tar) $p.Img }
+  "镜像已导出到: $ExportDir" | Write-Output
 }
 
-# ===== 11) 收集 MCP 工具清单 =====
-Start-Sleep 8
-$since=(Get-Date).AddMinutes(-10).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$log = docker logs librechat --since $since 2>&1
-$toolLines = $log | Select-String -Pattern "\[MCP\].*Tools:"
-$summaryText = ($toolLines | Select-Object -ExpandProperty Line) -join "`r`n"
-$summaryPath = Join-Path $WS "mcp_tools_summary.txt"
-$logPath     = Join-Path $WS "mcp_init_logs.txt"
-[IO.File]::WriteAllText($summaryPath,$summaryText,$enc)
-[IO.File]::WriteAllText($logPath,$log,$enc)
+# ========== 10) 直连与自检（最小生成量，三段回退） ==========
+function _ErrStr([object]$ex){ if($null -eq $ex){return ""}; try{return ($ex | Out-String).Trim()}catch{return "$ex"} }
 
-# ===== 12) 自检 =====
-if($ModelList.Count -gt 0){
-  $body = @{ model=$ModelList[0]; messages=@(@{role="user"; content="只回复ok"}) } | ConvertTo-Json -Depth 5
-  Invoke-RestMethod -Uri "http://localhost:11434/v1/chat/completions" -Method Post -ContentType "application/json" -Body $body | Out-Null
+function Test-Chat {
+  param([string]$Model)
+  $hdr = @{Accept="application/json";Connection="close"}
+
+  # A) /api/generate —— 最快，num_predict=1
+  try{
+    $bodyA = @{ model=$Model; prompt="OK"; stream=$false; options=@{ num_predict=1; temperature=0; top_p=0 } } | ConvertTo-Json -Depth 8
+    $ra = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/generate" -Method Post -ContentType "application/json" -Body $bodyA -Headers $hdr -TimeoutSec 120 -HttpVersion 1.1
+    if($ra -and $ra.response){ return @{ ok=$true; via="api/generate"; msg=$ra.response } }
+  }catch{ $eA = _ErrStr $_ }
+
+  # B) /api/chat —— 兼容 content 为数组或字符串
+  try{
+    $bodyB = @{ model=$Model; messages=@(@{role="user"; content="OK"}); stream=$false; options=@{ num_predict=1; temperature=0; top_p=0 } } | ConvertTo-Json -Depth 8
+    $rb = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/chat" -Method Post -ContentType "application/json" -Body $bodyB -Headers $hdr -TimeoutSec 120 -HttpVersion 1.1
+    if($rb -and $rb.message){
+      $c = $rb.message.content
+      if($c -is [string] -and $c.Length -gt 0){ return @{ ok=$true; via="api/chat"; msg=$c } }
+      if($c -is [System.Collections.IEnumerable]){
+        $t = ($c | Where-Object { $_.type -eq "text" } | Select-Object -First 1)
+        if($t -and $t.text){ return @{ ok=$true; via="api/chat[]"; msg=$t.text } }
+      }
+    }
+  }catch{ $eB = _ErrStr $_ }
+
+  # C) /v1/chat/completions —— OpenAI 兼容
+  try{
+    $bodyC = @{ model=$Model; messages=@(@{role="user"; content="OK"}); stream=$false; temperature=0; max_tokens=1 } | ConvertTo-Json -Depth 8
+    $rc = Invoke-RestMethod -Uri "http://127.0.0.1:11434/v1/chat/completions" -Method Post -ContentType "application/json" -Body $bodyC -Headers $hdr -TimeoutSec 120 -HttpVersion 1.1
+    if($rc -and $rc.choices -and $rc.choices[0].message.content){ return @{ ok=$true; via="v1/chat/completions"; msg=$rc.choices[0].message.content } }
+  }catch{ $eC = _ErrStr $_ }
+
+  return @{ ok=$false; via=""; errA=$eA; errB=$eB; errC=$eC }
 }
 
-"`n完成：
-- UI:           http://localhost:3080
-- MCP 网关：     http://localhost:8080/mcp
-- 工具清单：      $summaryPath
-- 初始化日志：    $logPath
-- 模型状态：      已导入：" + ($ModelList -join ', ')
+Start-Sleep 3
+$uiOk=$false; $gwOk=$false; $olOk=$false; $chatOK=$false; $chatVia=""
+try{
+  $u=Invoke-WebRequest -Uri "http://127.0.0.1:3080" -Method Get -TimeoutSec 15 -HttpVersion 1.1 -Headers @{Connection="close"}
+  if($u.StatusCode -ge 200 -and $u.StatusCode -lt 500){$uiOk=$true}
+}catch{
+  try{ $uiOk = ("true" -eq (docker inspect -f "{{.State.Running}}" librechat 2>$null)) }catch{}
+}
+try{ $gwOk=Test-Gw }catch{}
+try{
+  $m=Invoke-RestMethod -Uri "http://127.0.0.1:11434/v1/models" -Method Get -TimeoutSec 8 -HttpVersion 1.1 -Headers @{Accept="application/json";Connection="close"}
+  if($m){$olOk=$true}
+}catch{}
+
+$sel = if($selected){ $selected[0] } else { $require }
+$res = Test-Chat -Model $sel
+if($res.ok){ $chatOK=$true; $chatVia=$res.via } else {
+  Write-Warning ("Chat直连失败 详细: api/generate=[{0}] api/chat=[{1}] v1=[{2}]" -f $res.errA,$res.errB,$res.errC)
+  Write-Host "`n--- 最近 80 行 ollama 日志 ---"
+  docker logs --tail 80 ollama 2>&1 | Write-Host
+}
+
+"`n完成:
+- UI:               http://localhost:3080     状态: " + ($(if($uiOk){"OK"}else{"未知"})) + "
+- MCP 网关:          http://localhost:8080     状态: " + ($(if($gwOk){"OK"}else{"未知"})) + "
+- Ollama API:        http://localhost:11434    状态: " + ($(if($olOk){"OK"}else{"未知"})) + "
+- 模型(default):      " + ($(if($selected){$selected -join ', '}else{'<空>'})) + "
+- Qwen3 目标:         " + ($(if($models -contains $require){"OK"}else{"缺失"})) + "
+- Chat直连测试:       " + ($(if($chatOK){"OK via " + $chatVia}else{"失败"})) + "
+- Compose:           $Compose
+- 卷:                libre_mongo_data, libre_ollama_data, libre_workspace, libre_cache
+- 追加模型方法:       将 .ollama 放入 libre_cache 或 docker exec ollama ollama pull qwen3:8b
+" | Write-Output
+
+Remove-Item -Recurse -Force $Tmp
