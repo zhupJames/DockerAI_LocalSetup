@@ -91,7 +91,7 @@ gemma3_latest.ollama
 
 ## 五、手动启动方式（可选）
 
-若不使用《一键配置.md》，可将脚本保存为 `bringup.ps1` 并手动执行。
+可下载脚本 `一键部署.ps1` 并手动执行。
 执行前将脚本中的
 
 ```powershell
